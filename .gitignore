@@ -1,0 +1,10 @@
+myvenv/
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+__pycache__/
+.vscode/
+*.pyc
+.DS_Store

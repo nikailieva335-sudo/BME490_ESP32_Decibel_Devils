@@ -14,12 +14,14 @@ from matplotlib.animation import FuncAnimation
 DEVICE_NAME = "MicDB"
 SOUND_UUID = "6e400002-a1b2-4c3d-9e8f-0123456789ab"
 WINDOW_SECONDS = 30
-Y_MIN, Y_MAX = -5, 50
-TARGET_LOW, TARGET_HIGH = 10, 20
+Y_MIN, Y_MAX = -100, 0
+
+# Set to (known SPL in dB) - (measured dBFS) using a sound-level calibrator
+# or a reference meter placed beside the microphone. Leave None for raw dBFS.
+SPL_CALIBRATION_OFFSET_DB = 107.0
 
 SAMPLE_RATE_HZ = 8000
 FRAME_SAMPLES = 512
-CALIBRATION_FRAMES = 20
 FREQUENCY_AVG_WINDOW = 7
 MIN_VOICE_FREQ_HZ = 60
 MAX_VOICE_FREQ_HZ = 1200
@@ -149,29 +151,41 @@ def estimate_frequency(samples):
     return 0.0
 
 
+def measure_a_weighted_dbfs(samples):
+    centered = samples.astype(np.float64) - float(np.mean(samples))
+    window = np.hanning(len(centered))
+    spectrum = np.fft.rfft(centered * window)
+    frequencies = np.fft.rfftfreq(len(centered), d=1.0 / SAMPLE_RATE_HZ)
+
+    f_squared = np.maximum(frequencies, 1e-12) ** 2
+    ra = (
+        (12194.0 ** 2 * f_squared ** 2)
+        / (
+            (f_squared + 20.6 ** 2)
+            * np.sqrt((f_squared + 107.7 ** 2) * (f_squared + 737.9 ** 2))
+            * (f_squared + 12194.0 ** 2)
+        )
+    )
+    weighting = 10.0 ** ((20.0 * np.log10(ra) + 2.0) / 20.0)
+    weighting[0] = 0.0
+
+    weighted_power = np.abs(spectrum) ** 2 * weighting ** 2
+    weighted_power[1:-1] *= 2.0
+    mean_square = float(
+        np.sum(weighted_power) / (len(centered) * np.sum(window ** 2))
+    )
+    rms = math.sqrt(mean_square)
+    full_scale_sine_rms = 32768.0 / math.sqrt(2.0)
+    return 20.0 * math.log10(max(rms, 1.0) / full_scale_sine_rms)
+
+
 def process_audio():
-    calibration = deque(maxlen=CALIBRATION_FRAMES)
     frequency_history = deque(maxlen=FREQUENCY_AVG_WINDOW)
-    reference_rms = None
     invalid_pitch_frames = 0
 
     while True:
         samples = audio_frames.get()
-        centered = samples.astype(np.float64) - float(np.mean(samples))
-        rms = float(np.sqrt(np.mean(centered * centered)))
-
-        if reference_rms is None:
-            calibration.append(rms)
-            status["text"] = (
-                f"Calibrating: keep quiet ({len(calibration)}/"
-                f"{CALIBRATION_FRAMES})"
-            )
-            if len(calibration) == CALIBRATION_FRAMES:
-                reference_rms = max(float(np.mean(calibration)), 0.5)
-                status["text"] = "Connected"
-                print(f"Quiet-room reference RMS: {reference_rms:.2f}")
-            continue
-
+        dbfs = measure_a_weighted_dbfs(samples)
         frequency = estimate_frequency(samples)
         if frequency > 0.0:
             frequency_history.append(frequency)
@@ -184,7 +198,10 @@ def process_audio():
         smoothed_frequency = (
             float(np.mean(frequency_history)) if frequency_history else 0.0
         )
-        db = 20.0 * math.log10(max(rms, 0.01) / reference_rms)
+        db = dbfs
+        if SPL_CALIBRATION_OFFSET_DB is not None:
+            db += SPL_CALIBRATION_OFFSET_DB
+
         with readings_lock:
             readings.append((time.monotonic(), db, smoothed_frequency))
 
@@ -239,7 +256,8 @@ def update(_):
     ax_freq.autoscale_view(scalex=False)
 
     _, db, frequency = snapshot[-1]
-    ax_db.set_title(f"{db:.1f} dB")
+    level_unit = "dBA" if SPL_CALIBRATION_OFFSET_DB is not None else "dBFS(A)"
+    ax_db.set_title(f"{db:.1f} {level_unit}")
     ax_freq.set_title(f"{frequency:.0f} Hz")
 
 
@@ -251,10 +269,13 @@ def main():
 
     fig, (ax_db, ax_freq) = plt.subplots(2, 1, sharex=True, figsize=(8, 6))
     (db_line,) = ax_db.plot([], [], linewidth=2)
-    ax_db.axhspan(TARGET_LOW, TARGET_HIGH, color="green", alpha=0.2)
     ax_db.set_xlim(-WINDOW_SECONDS, 0)
-    ax_db.set_ylim(Y_MIN, Y_MAX)
-    ax_db.set_ylabel("Level (dB vs. quiet room)")
+    if SPL_CALIBRATION_OFFSET_DB is not None:
+        ax_db.set_ylim(-5, 120)
+        ax_db.set_ylabel("Level (dBA, calibrated)")
+    else:
+        ax_db.set_ylim(Y_MIN, Y_MAX)
+        ax_db.set_ylabel("Level (dBFS, A-weighted)")
 
     (freq_line,) = ax_freq.plot([], [], linewidth=2, color="tab:orange")
     ax_freq.set_xlabel("Seconds")

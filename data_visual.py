@@ -1,28 +1,192 @@
 import asyncio
+import math
+import queue
+import struct
 import threading
 import time
 from collections import deque
 
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+import numpy as np
 from bleak import BleakClient, BleakScanner
+from matplotlib.animation import FuncAnimation
 
-DEVICE_NAME = "MicDB"                                    # name the ESP32 advertises
-SOUND_UUID = "6e400002-a1b2-4c3d-9e8f-0123456789ab"      # sound-level characteristic on the ESP32
+DEVICE_NAME = "MicDB"
+SOUND_UUID = "6e400002-a1b2-4c3d-9e8f-0123456789ab"
 WINDOW_SECONDS = 30
-Y_MIN, Y_MAX = -5, 50          # dB relative to the quiet room at startup
+Y_MIN, Y_MAX = -5, 50
 TARGET_LOW, TARGET_HIGH = 10, 20
-readings = deque(maxlen=1000)  # ~50 s of data at 20 packets/s
+
+SAMPLE_RATE_HZ = 8000
+FRAME_SAMPLES = 512
+CALIBRATION_FRAMES = 20
+FREQUENCY_AVG_WINDOW = 7
+MIN_VOICE_FREQ_HZ = 60
+MAX_VOICE_FREQ_HZ = 1200
+YIN_THRESHOLD = 0.30
+HIGHPASS_CUTOFF_HZ = 80.0
+MIN_LAG = int(SAMPLE_RATE_HZ / MAX_VOICE_FREQ_HZ)
+MAX_LAG = int(SAMPLE_RATE_HZ / MIN_VOICE_FREQ_HZ)
+
+readings = deque(maxlen=2000)
+readings_lock = threading.Lock()
+audio_frames = queue.Queue(maxsize=16)
+frame_lock = threading.Lock()
+partial_frames = {}
 status = {"text": "Starting..."}
+ax_db = None
+ax_freq = None
+db_line = None
+freq_line = None
 
 
 def on_data(_, data):
-    if len(data) != 8:
+    if len(data) < 10:
         return
 
-    db = int.from_bytes(data[0:4], "little", signed=True) / 10
-    frequency = int.from_bytes(data[4:8], "little", signed=True)
-    readings.append((time.monotonic(), db, frequency))
+    frame_id, offset, sample_count, sample_rate = struct.unpack_from(
+        "<HHHH", data
+    )
+    sample_data = data[8:]
+    if (
+        sample_count != FRAME_SAMPLES
+        or sample_rate != SAMPLE_RATE_HZ
+        or len(sample_data) % 2
+    ):
+        return
+
+    samples = np.frombuffer(sample_data, dtype="<i2")
+    end = offset + len(samples)
+    if end > FRAME_SAMPLES:
+        return
+
+    with frame_lock:
+        frame = partial_frames.get(frame_id)
+        if frame is None:
+            frame = {
+                "samples": np.empty(FRAME_SAMPLES, dtype=np.int16),
+                "received": np.zeros(FRAME_SAMPLES, dtype=bool),
+            }
+            partial_frames[frame_id] = frame
+
+        frame["samples"][offset:end] = samples
+        frame["received"][offset:end] = True
+
+        if frame["received"].all():
+            del partial_frames[frame_id]
+            try:
+                audio_frames.put_nowait(frame["samples"].copy())
+            except queue.Full:
+                try:
+                    audio_frames.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    audio_frames.put_nowait(frame["samples"].copy())
+                except queue.Full:
+                    status["text"] = "Audio processing queue full; dropping frames"
+
+        while len(partial_frames) > 4:
+            del partial_frames[next(iter(partial_frames))]
+
+
+def estimate_frequency(samples):
+    """Estimate the voiced fundamental in Hz with YIN; return zero if unvoiced."""
+    mean_removed = samples.astype(np.float64) - float(np.mean(samples))
+
+    w0 = 2.0 * math.pi * HIGHPASS_CUTOFF_HZ / SAMPLE_RATE_HZ
+    alpha = math.sin(w0) / (2.0 * 0.7071)
+    cosw = math.cos(w0)
+    a0 = 1.0 + alpha
+    b0 = (1.0 + cosw) / 2.0 / a0
+    b1 = -(1.0 + cosw) / a0
+    b2 = b0
+    a1 = -2.0 * cosw / a0
+    a2 = (1.0 - alpha) / a0
+
+    filtered = np.empty_like(mean_removed)
+    x1 = x2 = y1 = y2 = 0.0
+    for i, x0 in enumerate(mean_removed):
+        y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        filtered[i] = y0
+        x2, x1 = x1, x0
+        y2, y1 = y1, y0
+
+    cmnd = np.ones(MAX_LAG + 1, dtype=np.float64)
+    running_sum = 0.0
+    for lag in range(1, MAX_LAG + 1):
+        delta = filtered[:-lag] - filtered[lag:]
+        difference = float(np.dot(delta, delta))
+        running_sum += difference
+        if running_sum > 1e-12:
+            cmnd[lag] = difference * lag / running_sum
+
+    selected_lag = None
+    for lag in range(MIN_LAG, MAX_LAG + 1):
+        if cmnd[lag] < YIN_THRESHOLD:
+            while lag < MAX_LAG and cmnd[lag + 1] < cmnd[lag]:
+                lag += 1
+            selected_lag = lag
+            break
+
+    if selected_lag is None:
+        return 0.0
+
+    lag = float(selected_lag)
+    if 1 < selected_lag < MAX_LAG:
+        left, center, right = cmnd[selected_lag - 1:selected_lag + 2]
+        denominator = left - 2.0 * center + right
+        if abs(denominator) > 1e-12:
+            correction = 0.5 * (left - right) / denominator
+            lag += max(-1.0, min(1.0, correction))
+
+    if lag <= 0.0:
+        return 0.0
+
+    frequency = SAMPLE_RATE_HZ / lag
+    if MIN_VOICE_FREQ_HZ <= frequency <= MAX_VOICE_FREQ_HZ:
+        return frequency
+    return 0.0
+
+
+def process_audio():
+    calibration = deque(maxlen=CALIBRATION_FRAMES)
+    frequency_history = deque(maxlen=FREQUENCY_AVG_WINDOW)
+    reference_rms = None
+    invalid_pitch_frames = 0
+
+    while True:
+        samples = audio_frames.get()
+        centered = samples.astype(np.float64) - float(np.mean(samples))
+        rms = float(np.sqrt(np.mean(centered * centered)))
+
+        if reference_rms is None:
+            calibration.append(rms)
+            status["text"] = (
+                f"Calibrating: keep quiet ({len(calibration)}/"
+                f"{CALIBRATION_FRAMES})"
+            )
+            if len(calibration) == CALIBRATION_FRAMES:
+                reference_rms = max(float(np.mean(calibration)), 0.5)
+                status["text"] = "Connected"
+                print(f"Quiet-room reference RMS: {reference_rms:.2f}")
+            continue
+
+        frequency = estimate_frequency(samples)
+        if frequency > 0.0:
+            frequency_history.append(frequency)
+            invalid_pitch_frames = 0
+        else:
+            invalid_pitch_frames += 1
+            if invalid_pitch_frames >= 3:
+                frequency_history.clear()
+
+        smoothed_frequency = (
+            float(np.mean(frequency_history)) if frequency_history else 0.0
+        )
+        db = 20.0 * math.log10(max(rms, 0.01) / reference_rms)
+        with readings_lock:
+            readings.append((time.monotonic(), db, smoothed_frequency))
 
 
 async def ble_task():
@@ -38,8 +202,14 @@ async def ble_task():
 
         try:
             async with BleakClient(device) as client:
-                status["text"] = "Connected"
-                print("Connected. Close the graph window to quit.")
+                mtu = client.mtu_size
+                if mtu < 64:
+                    status["text"] = f"Connected (BLE MTU {mtu}; audio may drop)"
+                    print(status["text"])
+                else:
+                    status["text"] = "Connected"
+                    print(f"Connected with BLE MTU {mtu}. "
+                          "Close the graph window to quit.")
                 await client.start_notify(SOUND_UUID, on_data)
                 while client.is_connected:
                     await asyncio.sleep(0.5)
@@ -53,7 +223,9 @@ async def ble_task():
 
 def update(_):
     now = time.monotonic()
-    recent = [(t - now, db, f) for t, db, f in list(readings)
+    with readings_lock:
+        snapshot = list(readings)
+    recent = [(t - now, db, f) for t, db, f in snapshot
               if now - t <= WINDOW_SECONDS]
 
     if not recent:
@@ -63,33 +235,35 @@ def update(_):
     xs, dbs, freqs = zip(*recent)
     db_line.set_data(xs, dbs)
     freq_line.set_data(xs, freqs)
-
-    # Frequency range isn't known ahead of time, so rescale its y-axis
     ax_freq.relim()
     ax_freq.autoscale_view(scalex=False)
 
-    _, db, frequency = readings[-1]
-    ax_db.set_title(f"{db:.1f} dB")          # top graph title
-    ax_freq.set_title(f"{frequency} Hz")     # bottom graph title
+    _, db, frequency = snapshot[-1]
+    ax_db.set_title(f"{db:.1f} dB")
+    ax_freq.set_title(f"{frequency:.0f} Hz")
 
 
-threading.Thread(target=lambda: asyncio.run(ble_task()), daemon=True).start()
+def main():
+    global ax_db, ax_freq, db_line, freq_line
 
-fig, (ax_db, ax_freq) = plt.subplots(2, 1, sharex=True, figsize=(8, 6))
+    threading.Thread(target=process_audio, daemon=True).start()
+    threading.Thread(target=lambda: asyncio.run(ble_task()), daemon=True).start()
 
-# Decibel plot (top)
-(db_line,) = ax_db.plot([], [], linewidth=2)
-ax_db.axhspan(TARGET_LOW, TARGET_HIGH, color="green", alpha=0.2)
-ax_db.set_xlim(-WINDOW_SECONDS, 0)
-ax_db.set_ylim(Y_MIN, Y_MAX)
-ax_db.set_ylabel("Level (dB vs. quiet room)")
+    fig, (ax_db, ax_freq) = plt.subplots(2, 1, sharex=True, figsize=(8, 6))
+    (db_line,) = ax_db.plot([], [], linewidth=2)
+    ax_db.axhspan(TARGET_LOW, TARGET_HIGH, color="green", alpha=0.2)
+    ax_db.set_xlim(-WINDOW_SECONDS, 0)
+    ax_db.set_ylim(Y_MIN, Y_MAX)
+    ax_db.set_ylabel("Level (dB vs. quiet room)")
 
-# Frequency plot (bottom)
-(freq_line,) = ax_freq.plot([], [], linewidth=2, color="tab:orange")
-ax_freq.set_xlabel("Seconds")
-ax_freq.set_ylabel("Frequency (Hz)")
+    (freq_line,) = ax_freq.plot([], [], linewidth=2, color="tab:orange")
+    ax_freq.set_xlabel("Seconds")
+    ax_freq.set_ylabel("Frequency (Hz)")
 
-fig.tight_layout()
-anim = FuncAnimation(fig, update, interval=100, cache_frame_data=False)
-plt.show()
- 
+    fig.tight_layout()
+    animation = FuncAnimation(fig, update, interval=100, cache_frame_data=False)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()

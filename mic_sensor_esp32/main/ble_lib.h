@@ -3,11 +3,10 @@
 #include <stdint.h>
 
 /* Error flags reported through the Errors characteristic (bitmask) */
-#define ERR_ADC_READ   (1u << 0)
+#define ERR_AUDIO_READ (1u << 0)
 
 /*
- * Starts NimBLE and advertises as "MicDB".
- * `callbacks` is unused (kept so the call matches the nRF version). Returns 0 on success.
+ * Starts NimBLE and advertises as "MicDB". Returns 0 on success.
  */
 int bluetooth_init(void *callbacks);
 
@@ -15,9 +14,10 @@ int bluetooth_init(void *callbacks);
 void bluetooth_set_errors(uint32_t flags);
 
 /*
- * Sends a sound-level packet: 8 bytes, little-endian
- *   int32 db10    (dB x 10, e.g. 124 = 12.4 dB)
- *   int32 freq_hz
- * Returns 0 on success (or when no client is subscribed), non-zero NimBLE error otherwise.
+ * Sends one raw audio frame as MTU-sized notifications. Each notification
+ * starts with little-endian uint16 frame_id, sample_offset, sample_count, and
+ * sample_rate_hz fields, followed by little-endian int16 samples. Returns 0
+ * on success or when nobody listens.
  */
-int bluetooth_send_sound_level(int32_t db10, int32_t freq_hz);
+int bluetooth_send_audio_frame(uint16_t frame_id, uint16_t sample_rate_hz,
+                               const int16_t *samples, uint16_t sample_count);

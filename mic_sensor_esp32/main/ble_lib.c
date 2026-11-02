@@ -1,19 +1,21 @@
 /*
- * Minimal NimBLE GATT server for the MAX4466 sound meter.
+ * Minimal NimBLE GATT server for the INMP441 audio stream.
  *
  * Service      : 6e400001-a1b2-4c3d-9e8f-0123456789ab
- *   Sound level: 6e400002-...  READ | NOTIFY  (8 bytes: int32 db10, int32 freq_hz, LE)
+ *   Audio data : 6e400002-...  READ | NOTIFY  (chunked signed 16-bit I2S samples)
  *   Errors     : 6e400003-...  READ | NOTIFY  (uint32 bitmask)
  *
  * If your phone app expects the UUIDs from the nRF ble_lib, paste them in below.
  */
 
-#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_att.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "ble_lib.h"
@@ -40,7 +42,8 @@ static volatile bool level_notify_on;
 static volatile bool errors_notify_on;
 static uint8_t own_addr_type;
 
-static uint8_t level_payload[8];
+static uint8_t audio_payload[253];
+static uint16_t audio_payload_len;
 static uint32_t error_flags;
 
 static void start_advertising(void);
@@ -57,7 +60,7 @@ static int chr_access(uint16_t conn, uint16_t attr_handle,
 	int rc;
 
 	if (attr_handle == level_handle) {
-		rc = os_mbuf_append(ctxt->om, level_payload, sizeof(level_payload));
+		rc = os_mbuf_append(ctxt->om, audio_payload, audio_payload_len);
 	} else {
 		rc = os_mbuf_append(ctxt->om, &error_flags, sizeof(error_flags));
 	}
@@ -222,18 +225,59 @@ void bluetooth_set_errors(uint32_t flags)
 	}
 }
 
-int bluetooth_send_sound_level(int32_t db10, int32_t freq_hz)
+int bluetooth_send_audio_frame(uint16_t frame_id, uint16_t sample_rate_hz,
+			       const int16_t *samples, uint16_t sample_count)
 {
-	memcpy(&level_payload[0], &db10, 4);       /* ESP32 is little-endian */
-	memcpy(&level_payload[4], &freq_hz, 4);
-
 	if (conn_handle == BLE_HS_CONN_HANDLE_NONE || !level_notify_on) {
-		return 0;   /* Nobody listening: value is still readable, just not pushed */
+		return 0;
 	}
 
-	struct os_mbuf *om = ble_hs_mbuf_from_flat(level_payload, sizeof(level_payload));
-	if (!om) {
-		return BLE_HS_ENOMEM;
+	uint16_t mtu = ble_att_mtu(conn_handle);
+	if (mtu <= 3 + 8) {
+		return BLE_HS_EMSGSIZE;
 	}
-	return ble_gatts_notify_custom(conn_handle, level_handle, om);
+
+	size_t max_samples = (mtu - 3 - 8) / sizeof(int16_t);
+	uint16_t offset = 0;
+
+	while (offset < sample_count) {
+		size_t count = sample_count - offset;
+		if (count > max_samples) {
+			count = max_samples;
+		}
+
+		audio_payload[0] = (uint8_t)(frame_id & 0xff);
+		audio_payload[1] = (uint8_t)(frame_id >> 8);
+		audio_payload[2] = (uint8_t)(offset & 0xff);
+		audio_payload[3] = (uint8_t)(offset >> 8);
+		audio_payload[4] = (uint8_t)(sample_count & 0xff);
+		audio_payload[5] = (uint8_t)(sample_count >> 8);
+		audio_payload[6] = (uint8_t)(sample_rate_hz & 0xff);
+		audio_payload[7] = (uint8_t)(sample_rate_hz >> 8);
+
+		for (size_t i = 0; i < count; i++) {
+			uint16_t sample = (uint16_t)samples[offset + i];
+			audio_payload[8 + 2 * i] = (uint8_t)(sample & 0xff);
+			audio_payload[9 + 2 * i] = (uint8_t)(sample >> 8);
+		}
+
+		audio_payload_len = 8 + 2 * count;
+		struct os_mbuf *om =
+			ble_hs_mbuf_from_flat(audio_payload, audio_payload_len);
+		if (!om) {
+			return BLE_HS_ENOMEM;
+		}
+
+		int rc = ble_gatts_notify_custom(conn_handle, level_handle, om);
+		if (rc != 0) {
+			return rc;
+		}
+
+		offset += count;
+		if (offset < sample_count) {
+			vTaskDelay(pdMS_TO_TICKS(1));
+		}
+	}
+
+	return 0;
 }

@@ -8,3 +8,7 @@ __pycache__/
 .vscode/
 *.pyc
 .DS_Store
+xcuserdata/
+DerivedData/
+.DS_Store
+*.xcuserstate
